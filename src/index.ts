@@ -133,19 +133,61 @@ export default function (pi: ExtensionAPI) {
 	const pending = new Set<string>();
 
 	// Replace fenced code blocks with placeholders so doubao never sees code.
+	// Prose between fences is further split into paragraphs (blank-line
+	// separated) so each one becomes its own segment for bilingual interleaving.
 	function splitCode(text: string): { parts: string[]; blocks: string[] } {
-		const parts: string[] = [];
+		const rawParts: string[] = [];
 		const blocks: string[] = [];
 		const re = /```[\s\S]*?```/g;
 		let last = 0;
 		let m: RegExpExecArray | null;
 		while ((m = re.exec(text)) !== null) {
-			if (m.index > last) parts.push(text.slice(last, m.index));
+			if (m.index > last) rawParts.push(text.slice(last, m.index));
 			blocks.push(m[0]);
 			last = m.index + m[0].length;
 		}
-		if (last < text.length) parts.push(text.slice(last));
+		if (last < text.length) rawParts.push(text.slice(last));
+		// Split each prose chunk into paragraphs, remembering separators so the
+		// rebuild can reassemble them.
+		const parts: string[] = [];
+		const separators: Array<string[]> = []; // trailing separators after parts[i-1]
+		for (const raw of rawParts) {
+			const paras = raw.split(/\n\s*\n/);
+			separators.push([]);
+			paras.forEach((p, i) => {
+				if (i > 0) separators[separators.length - 1].push("\n\n");
+				parts.push(p);
+			});
+		}
+		// Re-expand separators into the parts array: each part keeps its own
+		// leading/trailing text, paragraphs joined by \n\n in rebuild.
 		return { parts, blocks };
+	}
+
+	// Rebuild text from parts and blocks, walking the original fence structure.
+	function reassemble(text: string, blocks: string[], byPart: Map<number, string>): string {
+		let out = "";
+		let partIdx = 0;
+		let blockIdx = 0;
+		const re = /```[\s\S]*?```/g;
+		let last = 0;
+		let m: RegExpExecArray | null;
+		const emitProse = (prose: string) => {
+			const paras = prose.split(/\n\s*\n/);
+			paras.forEach((p, i) => {
+				if (i > 0) out += "\n\n";
+				out += p;
+				const t = byPart.get(partIdx++);
+				if (t) out += `\n\n${t}`;
+			});
+		};
+		while ((m = re.exec(text)) !== null) {
+			if (m.index > last) emitProse(text.slice(last, m.index));
+			out += blocks[blockIdx++] ?? m[0];
+			last = m.index + m[0].length;
+		}
+		if (last < text.length) emitProse(text.slice(last));
+		return out;
 	}
 
 	function mostlyCJK(text: string): boolean {
@@ -230,29 +272,38 @@ export default function (pi: ExtensionAPI) {
 			if (!segs) return null; // markers lost entirely: show original, no retry
 			translated = segs;
 		}
-		// Map marker slots back onto part indexes; keep whitespace around fences.
+		// Map marker slots back onto part indexes; dropped segments get retried.
 		const byPart = new Map<number, string>();
+		const missing: Array<{ slot: number; partIdx: number; text: string }> = [];
 		markers.forEach((partIdx, slot) => {
-			const p = parts[partIdx];
-			const lead = p.match(/^\s*/)?.[0] ?? "";
-			const trail = p.match(/\s*$/)?.[0] ?? "";
-			byPart.set(partIdx, lead + translated[slot] + trail);
+			const t = translated[slot];
+			if (t && !t.startsWith("*(translation unavailable")) byPart.set(partIdx, t);
+			else missing.push({ slot, partIdx, text: parts[partIdx].trim() });
 		});
-		// Rebuild: walk original text, emit translated part or original block.
-		let out = "";
-		let partIdx = 0;
-		let blockIdx = 0;
-		const re = /```[\s\S]*?```/g;
-		let last = 0;
-		let m: RegExpExecArray | null;
-		while ((m = re.exec(text)) !== null) {
-			if (m.index > last) out += byPart.get(partIdx++) ?? text.slice(last, m.index);
-			out += blocks[blockIdx++] ?? m[0];
-			last = m.index + m[0].length;
+		if (missing.length > 0) {
+			const filled = await fillMissing(missing);
+			for (const [partIdx, t] of filled) byPart.set(partIdx, t);
 		}
-		if (last < text.length) out += byPart.get(partIdx) ?? text.slice(last);
-		return out.trim() === text.trim() ? null : out;
+		return reassemble(text, blocks, byPart).trim() === text.trim()
+			? null
+			: reassemble(text, blocks, byPart);
 	}
+
+	// Doubao sometimes drops or merges a 【n】 marker. Retry those segments one by
+	// one (no marker needed for a single paragraph), then give up per segment.
+	async function fillMissing(
+	missing: Array<{ slot: number; partIdx: number; text: string }>,
+): Promise<Map<number, string>> {
+	const filled = new Map<number, string>();
+	await Promise.all(
+		missing.map(async ({ slot, partIdx, text }) => {
+			const t = await semaphore(() => translateProse(text));
+			if (t) filled.set(partIdx, t);
+			else filled.set(partIdx, missingNotice(slot + 1));
+		}),
+	);
+	return filled;
+}
 
 	const failedTexts = new Set<string>();
 
