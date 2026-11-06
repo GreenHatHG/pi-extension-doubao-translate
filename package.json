@@ -1,0 +1,31 @@
+{
+  "name": "pi-extension-doubao-translate",
+  "version": "0.1.0",
+  "description": "pi extension: auto-translate assistant replies to Chinese via the doubao server (/zh toggles display).",
+  "main": "src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "translate",
+    "doubao",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "type": "commonjs"
+}
