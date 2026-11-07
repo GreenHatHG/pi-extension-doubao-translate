@@ -33,6 +33,12 @@ const DOUBAO_PORT = 8765;
 // connection (/tmp/<TUNNEL_PREFIX><pid>-<rand>). Newest-first: an old dead
 // file must never win; a connect failure falls back to TCP in translateProse.
 const TUNNEL_PREFIX = "doubao-http-"; // bare filenames in /tmp, not absolute paths
+// After a failed translation, poll /health (local-only reply, no model call)
+// every 5s until the tunnel is back, then retry the text once. Give up after
+// one hour — beyond that the tunnel needs a manual reconnect anyway.
+const HEALTH_POLL_MS = 5_000;
+const HEALTH_TIMEOUT_MS = 3_000; // a black-holed tunnel must not hang the loop
+const RETRY_GIVEUP_MS = 60 * 60_000;
 
 function loadShowZh(): boolean {
 	try {
@@ -123,6 +129,60 @@ function translateProse(prose: string): Promise<string | null> {
 			path: "/translate",
 			method: "POST",
 			headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+		});
+	});
+}
+
+// GET /health through the same transport translateProse uses (newest tunnel
+// socket, TCP fallback). The reply is served from server state — no doubao
+// model call — so polling it is free. 3s timeout: a black-holed tunnel must
+// not hang the loop.
+function healthCheck(): Promise<boolean> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const done = (ok: boolean) => {
+			if (!settled) {
+				settled = true;
+				resolve(ok);
+			}
+		};
+		const timer = setTimeout(() => done(false), HEALTH_TIMEOUT_MS);
+
+		const request = (opts: http.RequestOptions) => {
+			const req = http.request(opts, (res) => {
+				let out = "";
+				res.on("data", (d: Buffer) => (out += d));
+				res.on("end", () => {
+					clearTimeout(timer);
+					try {
+						done((JSON.parse(out) as { ok?: boolean }).ok === true);
+					} catch {
+						done(false);
+					}
+				});
+			});
+			req.on("error", () => {
+				if (opts.socketPath) {
+					opts.socketPath = undefined;
+					opts.host = "127.0.0.1";
+					opts.port = DOUBAO_PORT;
+					request(opts);
+				} else {
+					clearTimeout(timer);
+					done(false);
+				}
+			});
+			req.end();
+		};
+
+		const socketPath = findTunnelSocket();
+		request({
+			socketPath: socketPath ?? undefined,
+			host: socketPath ? undefined : "127.0.0.1",
+			port: socketPath ? undefined : DOUBAO_PORT,
+			path: "/health",
+			method: "GET",
+			headers: { "content-length": 0 },
 		});
 	});
 }
@@ -306,7 +366,51 @@ export default function (pi: ExtensionAPI) {
 }
 
 	const failedTexts = new Set<string>();
+	let polling = false;
 
+	// After a failed translation: poll /health (free, no model call) every 5s
+	// until the tunnel answers, then retry the newest failed text once. One
+	// hour budget — beyond that the tunnel needs a manual reconnect anyway.
+	function startHealthPoll(ctx: Parameters<typeof requestTranslate>[1]) {
+		if (polling) return;
+		polling = true;
+		const deadline = Date.now() + RETRY_GIVEUP_MS;
+		const tick = async () => {
+			if (!polling) return;
+			if (await healthCheck()) {
+				polling = false;
+				const key = [...failedTexts].pop(); // newest failure only
+				if (key) forceTranslate(key, ctx);
+				return;
+			}
+			if (Date.now() >= deadline) {
+				polling = false;
+				try {
+					ctx.ui.notify("(translation: tunnel still down after 1h, gave up retrying)", "warning");
+				} catch {
+					// non-TUI mode
+				}
+				return;
+			}
+			setTimeout(tick, HEALTH_POLL_MS);
+		};
+		setTimeout(tick, HEALTH_POLL_MS);
+	}
+
+	// Manual trigger must bypass the pending/failed dedupe so a retry actually
+	// re-sends the request.
+	function forceTranslate(text: string, ctx: Parameters<typeof requestTranslate>[1]): boolean {
+		const key = text.trim();
+		if (key.length < MIN_LENGTH || mostlyCJK(key)) return false;
+		pending.delete(key);
+		failedTexts.delete(key);
+		translations.delete(key);
+		requestTranslate(key, ctx, true);
+		return true;
+	}
+
+	// notifyDone: manual triggers report back when the request settles; the
+	// auto path stays silent.
 	function requestTranslate(
 		text: string,
 		ctx: {
@@ -315,6 +419,7 @@ export default function (pi: ExtensionAPI) {
 				notify: (message: string, type?: "info" | "warning" | "error") => void;
 			};
 		},
+		notifyDone = false,
 	) {
 		const key = text.trim();
 		if (translations.has(key) || pending.has(key)) return;
@@ -326,15 +431,20 @@ export default function (pi: ExtensionAPI) {
 			if (t) {
 				failedTexts.delete(key);
 				translations.set(key, t);
-				if (showZh) refresh(ctx);
-			} else if (showZh && !failedTexts.has(key)) {
+				refresh(ctx);
+				if (notifyDone) ctx.ui.notify("Translation updated", "info");
+			} else if (!failedTexts.has(key)) {
 				// Warn once per failed text so the user knows why nothing appeared.
 				failedTexts.add(key);
+				refresh(ctx);
 				try {
 					ctx.ui.notify("(translation unavailable: doubao server not reachable)", "warning");
 				} catch {
 					// non-TUI mode
 				}
+				startHealthPoll(ctx);
+			} else if (notifyDone) {
+				refresh(ctx);
 			}
 		});
 	}
@@ -388,6 +498,42 @@ export default function (pi: ExtensionAPI) {
 				} catch {
 					// session not readable; new replies will still translate
 				}
+			}
+			refresh(ctx);
+		},
+	});
+
+	// Manual trigger: (re-)translate the most recent assistant reply on demand.
+	pi.registerCommand("translate", {
+		description: "Manually translate the latest assistant reply to Chinese",
+		handler: async (_args, ctx) => {
+			let latest: string | undefined;
+			try {
+				const entries = ctx.sessionManager.getEntries();
+				for (let i = entries.length - 1; i >= 0; i--) {
+					const msg = (entries[i] as { message?: { role?: string; content?: Array<{ type: string; text?: string }> } }).message;
+					if (msg?.role !== "assistant") continue;
+					const t = lastTextOf(msg);
+					if (t) {
+						latest = t;
+						break;
+					}
+				}
+			} catch {
+				// session not readable
+			}
+			if (!latest) {
+				ctx.ui.notify("No assistant reply to translate", "warning");
+				return;
+			}
+			if (!showZh) {
+				showZh = true;
+				saveShowZh(true);
+			}
+			if (forceTranslate(latest, ctx)) {
+				ctx.ui.notify("Translating latest reply…", "info");
+			} else {
+				ctx.ui.notify("Reply needs no translation", "info");
 			}
 			refresh(ctx);
 		},
