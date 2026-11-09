@@ -34,8 +34,8 @@ const DOUBAO_PORT = 8765;
 // file must never win; a connect failure falls back to TCP in translateProse.
 const TUNNEL_PREFIX = "doubao-http-"; // bare filenames in /tmp, not absolute paths
 // After a failed translation, poll /health (local-only reply, no model call)
-// every 5s until the tunnel is back, then retry the text once. Give up after
-// one hour — beyond that the tunnel needs a manual reconnect anyway.
+// every 5s until the tunnel is back, then retry the text ONCE. If that retry
+// fails too, give up — no further polling. Deadline is just a safety cap.
 const HEALTH_POLL_MS = 5_000;
 const HEALTH_TIMEOUT_MS = 3_000; // a black-holed tunnel must not hang the loop
 const RETRY_GIVEUP_MS = 60 * 60_000;
@@ -59,9 +59,12 @@ function saveShowZh(showZh: boolean): void {
 }
 
 // Newest-first tunnel candidates; a connect probe in translateProse settles
-function findTunnelSocket(): string | null {
+// Newest-first tunnel socket candidates. Dead sockets left behind by old
+// tunnels can still be newest by mtime, so callers must probe-connect them
+// in order and only fall back to TCP after every candidate fails.
+function findTunnelSockets(): string[] {
 	try {
-		const candidates = readdirSync("/tmp")
+		return readdirSync("/tmp")
 			.filter((f) => f.startsWith(TUNNEL_PREFIX))
 			.map((f) => `/tmp/${f}`)
 			.filter((p) => {
@@ -72,14 +75,16 @@ function findTunnelSocket(): string | null {
 				}
 			})
 			.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
-		return candidates[0] ?? null;
 	} catch {
-		return null;
+		return [];
 	}
 }
 
-// One HTTP POST to the doubao server. Tries the newest tunnel socket first
-// (VPS), then falls back to direct TCP 127.0.0.1:8765 (Mac). Never rejects.
+// One HTTP POST to the doubao server. Probes tunnel sockets newest-first
+// (VPS), falling back to direct TCP 127.0.0.1:8765 (Mac) only after every
+// socket candidate fails to connect. Each call re-scans /tmp, so a fresh
+// socket from a new tunnel is picked up immediately — nothing is cached.
+// Never rejects.
 function translateProse(prose: string): Promise<string | null> {
 	return new Promise((resolve) => {
 		const body = JSON.stringify({ text: prose, to: "zh" });
@@ -91,8 +96,9 @@ function translateProse(prose: string): Promise<string | null> {
 			}
 		};
 		const timer = setTimeout(() => done(null), 120_000);
+		const candidates = findTunnelSockets();
 
-		const request = (opts: http.RequestOptions) => {
+		const request = (opts: http.RequestOptions, socketIdx: number) => {
 			const req = http.request(opts, (res) => {
 				let out = "";
 				res.on("data", (d: Buffer) => (out += d));
@@ -107,12 +113,14 @@ function translateProse(prose: string): Promise<string | null> {
 				});
 			});
 			req.on("error", () => {
-				// socketPath miss falls back to TCP; TCP miss gives up
-				if (opts.socketPath) {
+				// next dead socket candidate, then TCP; TCP miss gives up
+				if (socketIdx < candidates.length - 1) {
+					request({ ...opts, socketPath: candidates[socketIdx + 1] }, socketIdx + 1);
+				} else if (opts.socketPath) {
 					opts.socketPath = undefined;
 					opts.host = "127.0.0.1";
 					opts.port = DOUBAO_PORT;
-					request(opts);
+					request(opts, candidates.length);
 				} else {
 					clearTimeout(timer);
 					done(null);
@@ -121,22 +129,24 @@ function translateProse(prose: string): Promise<string | null> {
 			req.end(body);
 		};
 
-		const socketPath = findTunnelSocket();
-		request({
-			socketPath: socketPath ?? undefined,
-			host: socketPath ? undefined : "127.0.0.1",
-			port: socketPath ? undefined : DOUBAO_PORT,
-			path: "/translate",
-			method: "POST",
-			headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
-		});
+		request(
+			{
+				socketPath: candidates[0],
+				host: candidates[0] ? undefined : "127.0.0.1",
+				port: candidates[0] ? undefined : DOUBAO_PORT,
+				path: "/translate",
+				method: "POST",
+				headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+			},
+			0,
+		);
 	});
 }
 
-// GET /health through the same transport translateProse uses (newest tunnel
-// socket, TCP fallback). The reply is served from server state — no doubao
-// model call — so polling it is free. 3s timeout: a black-holed tunnel must
-// not hang the loop.
+// GET /health through the same transport translateProse uses: probe all
+// tunnel sockets newest-first, TCP fallback. Each call re-scans /tmp.
+// The reply is served from server state — no doubao model call — so polling
+// it is free. 3s timeout: a black-holed tunnel must not hang the loop.
 function healthCheck(): Promise<boolean> {
 	return new Promise((resolve) => {
 		let settled = false;
@@ -147,8 +157,9 @@ function healthCheck(): Promise<boolean> {
 			}
 		};
 		const timer = setTimeout(() => done(false), HEALTH_TIMEOUT_MS);
+		const candidates = findTunnelSockets();
 
-		const request = (opts: http.RequestOptions) => {
+		const request = (opts: http.RequestOptions, socketIdx: number) => {
 			const req = http.request(opts, (res) => {
 				let out = "";
 				res.on("data", (d: Buffer) => (out += d));
@@ -162,11 +173,13 @@ function healthCheck(): Promise<boolean> {
 				});
 			});
 			req.on("error", () => {
-				if (opts.socketPath) {
+				if (socketIdx < candidates.length - 1) {
+					request({ ...opts, socketPath: candidates[socketIdx + 1] }, socketIdx + 1);
+				} else if (opts.socketPath) {
 					opts.socketPath = undefined;
 					opts.host = "127.0.0.1";
 					opts.port = DOUBAO_PORT;
-					request(opts);
+					request(opts, candidates.length);
 				} else {
 					clearTimeout(timer);
 					done(false);
@@ -175,15 +188,17 @@ function healthCheck(): Promise<boolean> {
 			req.end();
 		};
 
-		const socketPath = findTunnelSocket();
-		request({
-			socketPath: socketPath ?? undefined,
-			host: socketPath ? undefined : "127.0.0.1",
-			port: socketPath ? undefined : DOUBAO_PORT,
-			path: "/health",
-			method: "GET",
-			headers: { "content-length": 0 },
-		});
+		request(
+			{
+				socketPath: candidates[0],
+				host: candidates[0] ? undefined : "127.0.0.1",
+				port: candidates[0] ? undefined : DOUBAO_PORT,
+				path: "/health",
+				method: "GET",
+				headers: { "content-length": 0 },
+			},
+			0,
+		);
 	});
 }
 
@@ -238,7 +253,7 @@ export default function (pi: ExtensionAPI) {
 				if (i > 0) out += "\n\n";
 				out += p;
 				const t = byPart.get(partIdx++);
-				if (t) out += `\n\n${t}`;
+				if (t) out += `\n\n${quotePrefix(t)}`;
 			});
 		};
 		while ((m = re.exec(text)) !== null) {
@@ -369,8 +384,9 @@ export default function (pi: ExtensionAPI) {
 	let polling = false;
 
 	// After a failed translation: poll /health (free, no model call) every 5s
-	// until the tunnel answers, then retry the newest failed text once. One
-	// hour budget — beyond that the tunnel needs a manual reconnect anyway.
+	// until the tunnel answers, then retry the newest failed text ONCE. If that
+	// retry fails too, stop polling — a manual /translate is the only way back.
+	// Deadline is just a safety cap on the health wait.
 	function startHealthPoll(ctx: Parameters<typeof requestTranslate>[1]) {
 		if (polling) return;
 		polling = true;
@@ -380,7 +396,9 @@ export default function (pi: ExtensionAPI) {
 			if (await healthCheck()) {
 				polling = false;
 				const key = [...failedTexts].pop(); // newest failure only
-				if (key) forceTranslate(key, ctx);
+				if (!key) return;
+				failedTexts.delete(key);
+				forceTranslate(key, ctx);
 				return;
 			}
 			if (Date.now() >= deadline) {
@@ -539,11 +557,22 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Prepend a quote glyph to every line of the translation (originals are
+	// never touched — this only runs on the translation string).
+	function quotePrefix(t: string): string {
+		return t
+			.split("\n")
+			.map((line) => (line.trim() === "" ? "" : `» ${line}`))
+			.join("\n");
+	}
+
 	pi.registerMarkdownTransformer((markdown, { messageType, isStreaming }) => {
 		if (!showZh || isStreaming || messageType !== "assistant") return markdown;
 		const key = markdown.trim();
 		const t = translations.get(key);
 		if (t) return `${markdown.trimEnd()}\n\n---\n\n${t}`;
+		// t already has » prefixes (applied per translation paragraph inside
+		// reassemble); prefixing again here is what put icons on the original.
 		if (failedTexts.has(key)) {
 			return `${markdown.trimEnd()}\n\n---\n\n*(translation unavailable: doubao server not reachable)*`;
 		}
