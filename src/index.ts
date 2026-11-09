@@ -271,8 +271,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function mostlyCJK(text: string): boolean {
-		const cjk = (text.match(/[\u4e00-\u9fff]/g) ?? []).length;
-		return cjk > text.replace(/\s/g, "").length * 0.3;
+		const cjk = (text.match(/\u4e00-\u9fff/g) ?? []).length;
+		if (cjk > text.replace(/\s/g, "").length * 0.3) return true;
+		// ASCII-diluted Chinese (dense paths / package names / identifiers) can
+		// drop the ratio below 0.3. A natural Chinese sentence always contains a
+		// long run of consecutive CJK chars; English prose mentioning the odd
+		// Chinese term does not, so a run of >= 8 chars means "already Chinese".
+		return /[\u4e00-\u9fff]{8,}/.test(text);
 	}
 
 	// Run at most 5 in-flight requests; the server queues beyond that anyway,
