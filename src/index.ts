@@ -40,6 +40,11 @@ const HEALTH_POLL_MS = 5_000;
 const HEALTH_TIMEOUT_MS = 3_000; // a black-holed tunnel must not hang the loop
 const RETRY_GIVEUP_MS = 60 * 60_000;
 
+// Footer status shown while a translation is in flight. Key must be unique
+// per extension so other setStatus callers don't collide.
+const STATUS_KEY = "doubao-zh";
+const STATUS_LINGER_MS = 3_000; // how long ✓/✗ stays in the footer before clearing
+
 function loadShowZh(): boolean {
 	try {
 		const raw = JSON.parse(readFileSync(STATE_FILE, "utf8")) as { showZh?: boolean };
@@ -435,6 +440,7 @@ export default function (pi: ExtensionAPI) {
 			ui: {
 				setHiddenThinkingLabel: (l?: string) => void;
 				notify: (message: string, type?: "info" | "warning" | "error") => void;
+				setStatus?: (key: string, text?: string) => void;
 			};
 		},
 		notifyDone = false,
@@ -444,16 +450,26 @@ export default function (pi: ExtensionAPI) {
 		if (key.length < MIN_LENGTH) return;
 		if (mostlyCJK(key)) return;
 		pending.add(key);
+		// Footer status: show while the request is in flight. setStatus may be
+		// absent in older pi builds; degrade to silent.
+		const setStatus = ctx.ui.setStatus?.bind(ctx.ui);
+		const clearStatus = () => setStatus?.(STATUS_KEY, undefined);
+		const showStatus = (s: string) => setStatus?.(STATUS_KEY, s);
+		showStatus("⏳ 翻译中…");
 		void translateText(key).then((t) => {
 			pending.delete(key);
 			if (t) {
 				failedTexts.delete(key);
 				translations.set(key, t);
+				showStatus("✓ 已翻译");
+				setTimeout(clearStatus, STATUS_LINGER_MS);
 				refresh(ctx);
 				if (notifyDone) ctx.ui.notify("Translation updated", "info");
 			} else if (!failedTexts.has(key)) {
 				// Warn once per failed text so the user knows why nothing appeared.
 				failedTexts.add(key);
+				showStatus("✗ 翻译不可用");
+				setTimeout(clearStatus, STATUS_LINGER_MS);
 				refresh(ctx);
 				try {
 					ctx.ui.notify("(translation unavailable: doubao server not reachable)", "warning");
@@ -463,6 +479,7 @@ export default function (pi: ExtensionAPI) {
 				startHealthPoll(ctx);
 			} else if (notifyDone) {
 				refresh(ctx);
+				clearStatus();
 			}
 		});
 	}
