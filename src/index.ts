@@ -11,7 +11,8 @@
  *     1. a unix-socket tunnel from tssh-vps.sh (/tmp/doubao-http-*), used on VPS
  *     2. direct TCP to 127.0.0.1:8765, used on the Mac where the server runs
  *       under launchd (com.jooooody.doubao-server: keepalive + autostart).
- * - Failure is silent when /zh is off; warn-once + inline notice when on.
+ * - Failure is silent when /zh is off; when on, only the LATEST failed reply
+ *   carries an inline notice — scrolling history never replays old warnings.
  *
  * Refresh trick: pi re-renders assistant messages when setHiddenThinkingLabel is
  * called (it walks every AssistantMessageComponent and rebuilds content, which
@@ -337,12 +338,15 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// One request for the whole reply: numbered prose chunks in, split back out.
-	async function translateText(text: string): Promise<string | null> {
+	// force (manual /translate): send every non-empty part — no length/CJK
+	// gate, and an identical-output result is still shown, not dropped.
+	async function translateText(text: string, force = false): Promise<string | null> {
 		const { parts, blocks } = splitCode(text);
 		const idxs: number[] = [];
 		parts.forEach((p, i) => {
 			const core = p.trim();
-			if (core.length >= MIN_LENGTH && !mostlyCJK(core)) idxs.push(i);
+			if (core.length === 0) return;
+			if (force || (core.length >= MIN_LENGTH && !mostlyCJK(core))) idxs.push(i);
 		});
 		if (idxs.length === 0) return null;
 		const { body, markers } = buildRequest(parts, idxs);
@@ -369,9 +373,9 @@ export default function (pi: ExtensionAPI) {
 			const filled = await fillMissing(missing);
 			for (const [partIdx, t] of filled) byPart.set(partIdx, t);
 		}
-		return reassemble(text, blocks, byPart).trim() === text.trim()
-			? null
-			: reassemble(text, blocks, byPart);
+		const out = reassemble(text, blocks, byPart);
+		if (!force && out.trim() === text.trim()) return null;
+		return out;
 	}
 
 	// Doubao sometimes drops or merges a 【n】 marker. Retry those segments one by
@@ -390,7 +394,9 @@ export default function (pi: ExtensionAPI) {
 	return filled;
 }
 
-	const failedTexts = new Set<string>();
+	// Only the newest failed reply shows the inline notice; older failures
+	// keep plain original text. Cleared when that text translates.
+	let lastFailedKey: string | null = null;
 	let polling = false;
 
 	// After a failed translation: poll /health (free, no model call) every 5s
@@ -405,10 +411,11 @@ export default function (pi: ExtensionAPI) {
 			if (!polling) return;
 			if (await healthCheck()) {
 				polling = false;
-				const key = [...failedTexts].pop(); // newest failure only
+				const key = lastFailedKey;
 				if (!key) return;
-				failedTexts.delete(key);
-				forceTranslate(key, ctx);
+				// fromRetry=true: a failed retry must not re-arm polling, or it
+				// would retry forever — one auto retry, then wait for /translate.
+				forceTranslate(key, ctx, true);
 				return;
 			}
 			if (Date.now() >= deadline) {
@@ -425,16 +432,17 @@ export default function (pi: ExtensionAPI) {
 		setTimeout(tick, HEALTH_POLL_MS);
 	}
 
-	// Manual trigger must bypass the pending/failed dedupe so a retry actually
-	// re-sends the request.
-	function forceTranslate(text: string, ctx: Parameters<typeof requestTranslate>[1]): boolean {
+	// Manual trigger must bypass EVERY gate — length, mostlyCJK, dedupe — so
+	// /translate always sends and a retry actually re-sends the request.
+	function forceTranslate(
+		text: string,
+		ctx: Parameters<typeof requestTranslate>[1],
+		fromRetry = false,
+	): void {
 		const key = text.trim();
-		if (key.length < MIN_LENGTH || mostlyCJK(key)) return false;
 		pending.delete(key);
-		failedTexts.delete(key);
 		translations.delete(key);
-		requestTranslate(key, ctx, true);
-		return true;
+		requestTranslate(key, ctx, true, fromRetry, true);
 	}
 
 	// notifyDone: manual triggers report back when the request settles; the
@@ -449,11 +457,15 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 		notifyDone = false,
+		fromRetry = false,
+		force = false,
 	) {
 		const key = text.trim();
-		if (translations.has(key) || pending.has(key)) return;
-		if (key.length < MIN_LENGTH) return;
-		if (mostlyCJK(key)) return;
+		if (!force) {
+			if (translations.has(key) || pending.has(key)) return;
+			if (key.length < MIN_LENGTH) return;
+			if (mostlyCJK(key)) return;
+		}
 		pending.add(key);
 		// Footer status: show while the request is in flight. setStatus may be
 		// absent in older pi builds; degrade to silent.
@@ -461,30 +473,24 @@ export default function (pi: ExtensionAPI) {
 		const clearStatus = () => setStatus?.(STATUS_KEY, undefined);
 		const showStatus = (s: string) => setStatus?.(STATUS_KEY, s);
 		showStatus("⏳ 翻译中…");
-		void translateText(key).then((t) => {
+		void translateText(key, force).then((t) => {
 			pending.delete(key);
 			if (t) {
-				failedTexts.delete(key);
 				translations.set(key, t);
+				if (lastFailedKey === key) lastFailedKey = null; // notice goes away
 				showStatus("✓ 已翻译");
 				setTimeout(clearStatus, STATUS_LINGER_MS);
 				refresh(ctx);
 				if (notifyDone) ctx.ui.notify("Translation updated", "info");
-			} else if (!failedTexts.has(key)) {
-				// Warn once per failed text so the user knows why nothing appeared.
-				failedTexts.add(key);
+			} else {
+				lastFailedKey = key;
 				showStatus("✗ 翻译不可用");
 				setTimeout(clearStatus, STATUS_LINGER_MS);
 				refresh(ctx);
-				try {
-					ctx.ui.notify("(translation unavailable: doubao server not reachable)", "warning");
-				} catch {
-					// non-TUI mode
-				}
-				startHealthPoll(ctx);
-			} else if (notifyDone) {
-				refresh(ctx);
-				clearStatus();
+				// Inline notice (transformer) is the single failure signal — no
+				// toast here. A failed health-poll retry (fromRetry) must not
+				// re-arm polling, or it would retry forever.
+				if (!fromRetry) startHealthPoll(ctx);
 			}
 		});
 	}
@@ -570,11 +576,8 @@ export default function (pi: ExtensionAPI) {
 				showZh = true;
 				saveShowZh(true);
 			}
-			if (forceTranslate(latest, ctx)) {
-				ctx.ui.notify("Translating latest reply…", "info");
-			} else {
-				ctx.ui.notify("Reply needs no translation", "info");
-			}
+			forceTranslate(latest, ctx);
+			ctx.ui.notify("Translating latest reply…", "info");
 			refresh(ctx);
 		},
 	});
@@ -592,11 +595,12 @@ export default function (pi: ExtensionAPI) {
 		if (!showZh || isStreaming || messageType !== "assistant") return markdown;
 		const key = markdown.trim();
 		const t = translations.get(key);
+		// t already carries » prefixes (applied per paragraph in reassemble);
+		// prefixing again HERE would put the icons on the original instead.
 		if (t) return `${markdown.trimEnd()}\n\n---\n\n${t}`;
-		// t already has » prefixes (applied per translation paragraph inside
-		// reassemble); prefixing again here is what put icons on the original.
-		if (failedTexts.has(key)) {
-			return `${markdown.trimEnd()}\n\n---\n\n*(translation unavailable: doubao server not reachable)*`;
+		// Latest failure only: one notice on screen at a time.
+		if (lastFailedKey === key) {
+			return `${markdown.trimEnd()}\n\n---\n\n*(翻译不可用，doubao 未响应)*`;
 		}
 		return markdown;
 	});
