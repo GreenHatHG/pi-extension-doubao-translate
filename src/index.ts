@@ -2,7 +2,8 @@
  * doubao-translate — auto-translate assistant replies via doubao_hook.
  *
  * - Only the final prose reply is translated: the LAST text block of an
- *   assistant message with no tool calls. Thinking blocks, tool calls and
+ *   assistant message with no real tool calls (watchdog_decide is exempt —
+ *   it rides along with the final reply). Thinking blocks, tool calls and
  *   mid-turn progress text are never sent to doubao.
  * - /zh toggles display: off = original only, on = original + Chinese below.
  *   State persists across sessions and machines via ~/.pi/agent/cache/.
@@ -509,11 +510,19 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	// Last text block of a tool-call-free assistant message = the final prose reply.
+	// Watchdog's control-plane call: bundled AFTER the final reply text in the
+	// same assistant message, so it must not disqualify that text. Real tool
+	// work does — its text blocks are mid-turn progress, never the final reply.
+	const CONTROL_PLANE_TOOLS = new Set(["watchdog_decide"]);
+
+	// Last text block of an assistant message = the final prose reply.
 	function lastTextOf(message: {
-		content?: Array<{ type: string; text?: string }>;
+		content?: Array<{ type: string; text?: string; name?: string }>;
 	}): string | undefined {
-		if (!Array.isArray(message.content) || message.content.some((c) => c.type === "toolCall")) return undefined;
+		if (!Array.isArray(message.content)) return undefined;
+		if (message.content.some((c) => c.type === "toolCall" && !CONTROL_PLANE_TOOLS.has(c.name ?? ""))) {
+			return undefined;
+		}
 		for (let i = message.content.length - 1; i >= 0; i--) {
 			const c = message.content[i];
 			if (c.type === "text" && c.text?.trim()) return c.text;
