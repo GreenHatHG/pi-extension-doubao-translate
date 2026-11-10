@@ -461,17 +461,22 @@ export default function (pi: ExtensionAPI) {
 		force = false,
 	) {
 		const key = text.trim();
-		if (!force) {
-			if (translations.has(key) || pending.has(key)) return;
-			if (key.length < MIN_LENGTH) return;
-			if (mostlyCJK(key)) return;
-		}
-		pending.add(key);
 		// Footer status: show while the request is in flight. setStatus may be
 		// absent in older pi builds; degrade to silent.
 		const setStatus = ctx.ui.setStatus?.bind(ctx.ui);
 		const clearStatus = () => setStatus?.(STATUS_KEY, undefined);
 		const showStatus = (s: string) => setStatus?.(STATUS_KEY, s);
+		if (!force) {
+			if (translations.has(key) || pending.has(key)) return;
+			// Auto path skipped this reply (too short / already Chinese). Say why
+			// in the footer — same spot as the timeout notice — instead of silence.
+			if (key.length < MIN_LENGTH || mostlyCJK(key)) {
+				showStatus("· 无需翻译（太短或已是中文）");
+				setTimeout(clearStatus, STATUS_LINGER_MS);
+				return;
+			}
+		}
+		pending.add(key);
 		showStatus("⏳ 翻译中…");
 		void translateText(key, force).then((t) => {
 			pending.delete(key);
