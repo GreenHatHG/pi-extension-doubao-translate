@@ -216,8 +216,75 @@ export default function (pi: ExtensionAPI) {
 
 	// Replace fenced code blocks with placeholders so doubao never sees code.
 	// Prose between fences is further split into paragraphs (blank-line
-	// separated) so each one becomes its own segment for bilingual interleaving.
-	function splitCode(text: string): { parts: string[]; blocks: string[] } {
+	// separated), and each paragraph is split again where a table starts or
+	// ends, so a table gets translated cell-by-cell even when a heading or a
+	// lead-in sentence sits on the line right above it.
+	type ProseChunk = { text: string; gap: string; para: number; table: boolean };
+
+	// Mirror of marked's table rule (the TUI uses marked): a header line that
+	// is not indented 4+ spaces (that is a code block), then a delimiter row
+	// with 1+ dashes per cell and the same cell count. Any other shape is prose.
+	function isAlignRow(line: string): string[] | null {
+		const body = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+		if (!body) return null;
+		const cells = body.split("|").map((c) => c.trim());
+		return cells.every((c) => /^:?-+:?$/.test(c)) ? cells : null;
+	}
+
+	function isTableStart(lines: string[], i: number): boolean {
+		const header = lines[i];
+		if (header === undefined || header.trim() === "" || /^ {4,}/.test(header)) return false;
+		if (!header.includes("|")) return false;
+		const align = isAlignRow(lines[i + 1] ?? "");
+		if (!align) return false;
+		return splitTableRow(header).cells.length === align.length;
+	}
+
+	// marked ends table rows at a blank line or the start of another block.
+	function startsNewBlock(line: string): boolean {
+		return (
+			/^ {0,3}(#{1,6}\s|>|```|~~~|[*+-]\s|\d+[.)]\s)/.test(line) ||
+			/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)
+		);
+	}
+
+	function splitParagraph(para: string): Array<{ text: string; table: boolean }> {
+		const lines = para.split("\n");
+		const out: Array<{ text: string; table: boolean }> = [];
+		let start = 0;
+		let i = 0;
+		const push = (end: number, table: boolean) => {
+			if (end > start) out.push({ text: lines.slice(start, end).join("\n"), table });
+		};
+		while (i < lines.length) {
+			if (isTableStart(lines, i)) {
+				push(i, false);
+				let j = i + 2; // header + delimiter row
+				while (j < lines.length && lines[j].trim() !== "" && !startsNewBlock(lines[j])) j++;
+				start = i;
+				push(j, true);
+				i = j;
+				start = j;
+			} else {
+				i++;
+			}
+		}
+		push(lines.length, false);
+		return out;
+	}
+
+	// splitCode and reassemble both call this, so part indexes can never desync.
+	function splitProseChunks(prose: string): ProseChunk[] {
+		const out: ProseChunk[] = [];
+		prose.split(/\n\s*\n/).forEach((para, paraIdx) => {
+			splitParagraph(para).forEach((c, i) => {
+				out.push({ ...c, para: paraIdx, gap: i === 0 ? (paraIdx === 0 ? "" : "\n\n") : "\n" });
+			});
+		});
+		return out;
+	}
+
+	function splitCode(text: string): { parts: string[]; blocks: string[]; tables: boolean[] } {
 		const rawParts: string[] = [];
 		const blocks: string[] = [];
 		const re = /```[\s\S]*?```/g;
@@ -229,21 +296,42 @@ export default function (pi: ExtensionAPI) {
 			last = m.index + m[0].length;
 		}
 		if (last < text.length) rawParts.push(text.slice(last));
-		// Split each prose chunk into paragraphs, remembering separators so the
-		// rebuild can reassemble them.
 		const parts: string[] = [];
-		const separators: Array<string[]> = []; // trailing separators after parts[i-1]
+		const tables: boolean[] = [];
 		for (const raw of rawParts) {
-			const paras = raw.split(/\n\s*\n/);
-			separators.push([]);
-			paras.forEach((p, i) => {
-				if (i > 0) separators[separators.length - 1].push("\n\n");
-				parts.push(p);
-			});
+			for (const c of splitProseChunks(raw)) {
+				parts.push(c.text);
+				tables.push(c.table);
+			}
 		}
-		// Re-expand separators into the parts array: each part keeps its own
-		// leading/trailing text, paragraphs joined by \n\n in rebuild.
-		return { parts, blocks };
+		return { parts, blocks, tables };
+	}
+
+	// Split a table row on unescaped pipes, keeping its leading/trailing shape.
+	function splitTableRow(line: string): { leading: boolean; trailing: boolean; cells: string[] } {
+		const trimmed = line.trim();
+		const leading = trimmed.startsWith("|");
+		const trailing = trimmed.endsWith("|");
+		let body = trimmed;
+		if (leading) body = body.slice(1);
+		if (trailing && body.endsWith("|")) body = body.slice(0, -1);
+		return { leading, trailing, cells: body.split(/(?<!\\)\|/).map((c) => c.trim()) };
+	}
+
+	// Replace only cell text; the alignment row is copied byte-identical.
+	function rebuildTable(block: string, trans: Map<string, string>): string {
+		return block
+			.split("\n")
+			.map((line, row) => {
+				if (row === 1 || line.trim() === "") return line;
+				const { leading, trailing, cells } = splitTableRow(line);
+				// A raw pipe inside translated text would add a column.
+				const next = cells.map((cell, col) =>
+					(trans.get(`${row}:${col}`) ?? cell).replace(/(?<!\\)\|/g, "\\|"),
+				);
+				return `${leading ? "| " : ""}${next.join(" | ")}${trailing ? " |" : ""}`;
+			})
+			.join("\n");
 	}
 
 	// Rebuild text from parts and blocks, walking the original fence structure.
@@ -255,12 +343,21 @@ export default function (pi: ExtensionAPI) {
 		let last = 0;
 		let m: RegExpExecArray | null;
 		const emitProse = (prose: string) => {
-			const paras = prose.split(/\n\s*\n/);
-			paras.forEach((p, i) => {
-				if (i > 0) out += "\n\n";
-				out += p;
-				const t = byPart.get(partIdx++);
-				if (t) out += `\n\n${quotePrefix(t)}`;
+			const chunks = splitProseChunks(prose);
+			const paras: ProseChunk[][] = [];
+			for (const c of chunks) (paras[c.para] ??= []).push(c);
+			paras.forEach((group) => {
+				let trans = "";
+				for (const c of group) {
+					out += c.gap + c.text;
+					const t = byPart.get(partIdx++);
+					// A translated table must stay raw markdown; a » prefix on every
+					// row would stop the TUI from parsing it as a table.
+					// Blank line between translated chunks so a table followed by a
+					// block start cannot swallow the » lines as extra rows.
+					if (t) trans += `${trans ? "\n\n" : ""}${c.table ? t : quotePrefix(t)}`;
+				}
+				if (trans) out += `\n\n${trans}`;
 			});
 		};
 		while ((m = re.exec(text)) !== null) {
@@ -306,12 +403,15 @@ export default function (pi: ExtensionAPI) {
 	// into ONE request and split the reply back on them. One reply = 1 request.
 	const MARKER_RE = /【(\d+)】/g;
 
-	function buildRequest(parts: string[], idxs: number[]): { body: string | null; markers: number[] } {
-		if (idxs.length === 0) return { body: null, markers: [] };
-		if (idxs.length === 1) return { body: parts[idxs[0]], markers: [idxs[0]] };
-		const markers = idxs.slice();
-		const body = markers.map((partIdx, i) => `【${i + 1}】${parts[partIdx]}`).join("\n\n");
-		return { body, markers };
+	// One entry sent to doubao. Table cells carry row/col so the reply can be
+	// stitched back into the original table instead of replacing it wholesale.
+	type Unit = { partIdx: number; text: string; row?: number; col?: number };
+
+	function buildRequest(units: Unit[]): { body: string | null; count: number } {
+		if (units.length === 0) return { body: null, count: 0 };
+		if (units.length === 1) return { body: units[0].text, count: 1 };
+		const body = units.map((u, i) => `【${i + 1}】${u.text}`).join("\n\n");
+		return { body, count: units.length };
 	}
 
 	// One part failed to come back from doubao. Italic + parens so it can't be
@@ -342,37 +442,77 @@ export default function (pi: ExtensionAPI) {
 	// force (manual /translate): send every non-empty part — no length/CJK
 	// gate, and an identical-output result is still shown, not dropped.
 	async function translateText(text: string, force = false): Promise<string | null> {
-		const { parts, blocks } = splitCode(text);
-		const idxs: number[] = [];
+		const { parts, blocks, tables } = splitCode(text);
+		const units: Unit[] = [];
 		parts.forEach((p, i) => {
 			const core = p.trim();
 			if (core.length === 0) return;
-			if (force || (core.length >= MIN_LENGTH && !mostlyCJK(core))) idxs.push(i);
+			if (tables[i]) {
+				p.split("\n").forEach((line, row) => {
+					if (row === 1 || line.trim() === "") return; // alignment row
+					splitTableRow(line).cells.forEach((cell, col) => {
+						if (!cell) return;
+						if (!force && (mostlyCJK(cell) || !/[A-Za-z]/.test(cell))) return;
+						units.push({ partIdx: i, text: cell, row, col });
+					});
+				});
+				return;
+			}
+			if (force || (core.length >= MIN_LENGTH && !mostlyCJK(core))) {
+				units.push({ partIdx: i, text: parts[i] });
+			}
 		});
-		if (idxs.length === 0) return null;
-		const { body, markers } = buildRequest(parts, idxs);
+		if (units.length === 0) return null;
+		const { body, count } = buildRequest(units);
 		if (!body) return null;
 		const reply = await semaphore(() => translateProse(body));
 		if (!reply) return null;
 		let translated: string[];
-		if (markers.length === 1) {
+		if (count === 1) {
 			translated = [reply];
 		} else {
-			const segs = splitTranslation(reply, markers.length);
+			const segs = splitTranslation(reply, count);
 			if (!segs) return null; // markers lost entirely: show original, no retry
 			translated = segs;
 		}
-		// Map marker slots back onto part indexes; dropped segments get retried.
+		// Map marker slots back onto parts; table cells land in their own map
+		// so the table can be rebuilt with the original shape. Dropped
+		// segments get retried.
 		const byPart = new Map<number, string>();
-		const missing: Array<{ slot: number; partIdx: number; text: string }> = [];
-		markers.forEach((partIdx, slot) => {
-			const t = translated[slot];
-			if (t && !t.startsWith("*(translation unavailable")) byPart.set(partIdx, t);
-			else missing.push({ slot, partIdx, text: parts[partIdx].trim() });
+		const cellTrans = new Map<number, Map<string, string>>();
+		const missing: Array<{ partIdx: number; text: string; row?: number; col?: number }> = [];
+		const putCell = (partIdx: number, row: number, col: number, t: string) => {
+			let m = cellTrans.get(partIdx);
+			if (!m) {
+				m = new Map();
+				cellTrans.set(partIdx, m);
+			}
+			m.set(`${row}:${col}`, t.replace(/\s*\n+\s*/g, " "));
+		};
+		units.forEach((u, i) => {
+			const t = translated[i];
+			if (t && !t.startsWith("*(translation unavailable")) {
+				if (u.row !== undefined && u.col !== undefined) putCell(u.partIdx, u.row, u.col, t);
+				else byPart.set(u.partIdx, t);
+			} else {
+				missing.push({ partIdx: u.partIdx, text: u.text, row: u.row, col: u.col });
+			}
 		});
 		if (missing.length > 0) {
 			const filled = await fillMissing(missing);
-			for (const [partIdx, t] of filled) byPart.set(partIdx, t);
+			filled.forEach((t, i) => {
+				const m = missing[i];
+				if (!t) {
+					// A table cell keeps its original text; prose shows the notice.
+					if (m.row === undefined) byPart.set(m.partIdx, missingNotice(i + 1));
+					return;
+				}
+				if (m.row !== undefined && m.col !== undefined) putCell(m.partIdx, m.row, m.col, t);
+				else byPart.set(m.partIdx, t);
+			});
+		}
+		for (const [partIdx, cells] of cellTrans) {
+			byPart.set(partIdx, rebuildTable(parts[partIdx], cells));
 		}
 		const out = reassemble(text, blocks, byPart);
 		if (!force && out.trim() === text.trim()) return null;
@@ -380,20 +520,19 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Doubao sometimes drops or merges a 【n】 marker. Retry those segments one by
-	// one (no marker needed for a single paragraph), then give up per segment.
+	// one (no marker needed for a single cell), then give up per segment.
 	async function fillMissing(
-	missing: Array<{ slot: number; partIdx: number; text: string }>,
-): Promise<Map<number, string>> {
-	const filled = new Map<number, string>();
-	await Promise.all(
-		missing.map(async ({ slot, partIdx, text }) => {
-			const t = await semaphore(() => translateProse(text));
-			if (t) filled.set(partIdx, t);
-			else filled.set(partIdx, missingNotice(slot + 1));
-		}),
-	);
-	return filled;
-}
+		missing: Array<{ partIdx: number; text: string; row?: number; col?: number }>,
+	): Promise<Map<number, string | null>> {
+		const filled = new Map<number, string | null>();
+		await Promise.all(
+			missing.map(async (m, i) => {
+				const t = await semaphore(() => translateProse(m.text.trim()));
+				filled.set(i, t);
+			}),
+		);
+		return filled;
+	}
 
 	// Only the newest failed reply shows the inline notice; older failures
 	// keep plain original text. Cleared when that text translates.
