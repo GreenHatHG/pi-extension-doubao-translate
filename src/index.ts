@@ -355,7 +355,10 @@ export default function (pi: ExtensionAPI) {
 					// row would stop the TUI from parsing it as a table.
 					// Blank line between translated chunks so a table followed by a
 					// block start cannot swallow the » lines as extra rows.
-					if (t) trans += `${trans ? "\n\n" : ""}${c.table ? t : quotePrefix(t)}`;
+					if (t) {
+						const block = c.table ? t : quotePrefix(t);
+						trans += `${trans ? "\n\n" : ""}${keepListsApart(block, trans || out)}`;
+					}
 				}
 				if (trans) out += `\n\n${trans}`;
 			});
@@ -735,12 +738,54 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// A translated list dropped right after a list in the original merges into
+	// it, so the renderer keeps counting (1, 2 → 3, 4). A different bullet or
+	// delimiter starts a fresh list; the TUI numbers lists from its own counter,
+	// so on screen the marker looks the same.
+	const listMarker = /^(\s*)(?:(\d{1,9})([.)])|([-*+]))(\s+)/;
+	function keepListsApart(block: string, before: string): string {
+		const tail = before.trimEnd().split(/\n\s*\n/).pop() ?? "";
+		const first = block.split("\n").find((l) => l.trim() !== "");
+		if (!first) return block;
+		const f = first.match(listMarker);
+		if (!f) return block;
+		// Only the last block matters: earlier ones are closed by a blank line.
+		let p: RegExpMatchArray | null = null;
+		for (const line of tail.split("\n")) {
+			const hit = line.match(listMarker);
+			if (hit) p = hit;
+		}
+		if (!p) return block;
+		const ordered = f[3] !== undefined;
+		const fCh = f[3] ?? f[4];
+		if (ordered !== (p[3] !== undefined) || fCh !== (p[3] ?? p[4])) return block;
+		const next = ordered ? (fCh === "." ? ")" : ".") : fCh === "-" ? "*" : "-";
+		const indent = f[1].length;
+		return block
+			.split("\n")
+			.map((line) => {
+				const m = line.match(listMarker);
+				if (!m || m[1].length !== indent || (m[3] ?? m[4]) !== fCh) return line;
+				return `${m[1]}${m[2] ?? ""}${next}${m[5]}${line.slice(m[0].length)}`;
+			})
+			.join("\n");
+	}
+
 	// Prepend a quote glyph to every line of the translation (originals are
-	// never touched — this only runs on the translation string).
+	// never touched — this only runs on the translation string). The glyph goes
+	// AFTER any markdown marker (##, -, 1., >, task box) so headings, lists and
+	// quotes still parse; a leading » would make the whole line plain text.
+	const mdMarker = /^(\s*(?:>\s*)*(?:#{1,6}\s+|(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)?)/;
+	const hrLine = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/;
 	function quotePrefix(t: string): string {
 		return t
 			.split("\n")
-			.map((line) => (line.trim() === "" ? "" : `» ${line}`))
+			.map((line) => {
+				if (line.trim() === "" || hrLine.test(line)) return line;
+				const m = line.match(mdMarker);
+				const at = m ? m[1].length : 0;
+				return `${line.slice(0, at)}» ${line.slice(at)}`;
+			})
 			.join("\n");
 	}
 
