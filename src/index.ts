@@ -777,6 +777,10 @@ export default function (pi: ExtensionAPI) {
 	// quotes still parse; a leading » would make the whole line plain text.
 	const mdMarker = /^(\s*(?:>\s*)*(?:#{1,6}\s+|(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)?)/;
 	const hrLine = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/;
+	// Translation separator. » glyphs so it can't collide with original `---`;
+	// plain text (no markdown meaning), no styling in the TUI renderer.
+	// 30 glyphs, ~one terminal line
+	const SEP = "»»»»»»»»»»»»»»»»»»»»»»»»»»»»»»»";
 	function quotePrefix(t: string): string {
 		return t
 			.split("\n")
@@ -795,7 +799,7 @@ export default function (pi: ExtensionAPI) {
 		const t = translations.get(key);
 		// t already carries » prefixes (applied per paragraph in reassemble);
 		// prefixing again HERE would put the icons on the original instead.
-		if (t) return `${markdown.trimEnd()}\n\n---\n\n${t}`;
+		if (t) return `${markdown.trimEnd()}\n\n${SEP}\n\n${t}`;
 		// Latest failure only: one notice on screen at a time.
 		if (lastFailedKey === key) {
 			return `${markdown.trimEnd()}\n\n---\n\n*(翻译不可用，doubao 未响应)*`;
