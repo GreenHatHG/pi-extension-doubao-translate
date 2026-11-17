@@ -45,7 +45,9 @@ const RETRY_GIVEUP_MS = 60 * 60_000;
 // Footer status shown while a translation is in flight. Key must be unique
 // per extension so other setStatus callers don't collide.
 const STATUS_KEY = "doubao-zh";
-const STATUS_LINGER_MS = 3_000; // how long ✓/✗ stays in the footer before clearing
+const STATUS_LINGER_MS = 3_000; // how long ✓/· statuses stay in the footer before clearing
+// Failure status has NO timer: it stays until the next status overwrites it
+// (success clears it, a new failure replaces it).
 
 function loadShowZh(): boolean {
 	try {
@@ -91,18 +93,24 @@ function findTunnelSockets(): string[] {
 // (VPS), falling back to direct TCP 127.0.0.1:8765 (Mac) only after every
 // socket candidate fails to connect. Each call re-scans /tmp, so a fresh
 // socket from a new tunnel is picked up immediately — nothing is cached.
-// Never rejects.
-function translateProse(prose: string): Promise<string | null> {
+// Never rejects. Resolves why it failed: server `error` field (e.g. doubao's
+// own "Failed to fetch"), transport unreachable, or timeout. /health can pass
+// while /translate fails — health doesn't hit the doubao page at all.
+type TranslateResult = { text: string | null; reason: string | null };
+let lastFailReason: string | null = null;
+
+function translateProse(prose: string): Promise<TranslateResult> {
 	return new Promise((resolve) => {
 		const body = JSON.stringify({ text: prose, to: "zh" });
 		let settled = false;
-		const done = (t: string | null) => {
+		const done = (r: TranslateResult) => {
 			if (!settled) {
 				settled = true;
-				resolve(t);
+				if (!r.text) lastFailReason = r.reason;
+				resolve(r);
 			}
 		};
-		const timer = setTimeout(() => done(null), 120_000);
+		const timer = setTimeout(() => done({ text: null, reason: "timeout after 120s" }), 120_000);
 		const candidates = findTunnelSockets();
 
 		const request = (opts: http.RequestOptions, socketIdx: number) => {
@@ -112,10 +120,15 @@ function translateProse(prose: string): Promise<string | null> {
 				res.on("end", () => {
 					clearTimeout(timer);
 					try {
-						const data = JSON.parse(out) as { ok?: boolean; translation?: string };
-						done(data.ok && data.translation ? data.translation.trim() : null);
+						const data = JSON.parse(out) as { ok?: boolean; translation?: string; error?: string };
+						if (data.ok && data.translation) {
+							done({ text: data.translation.trim(), reason: null });
+						} else {
+							const why = data.error ? String(data.error).split("\n")[0].slice(0, 160) : "server returned ok:false";
+							done({ text: null, reason: why });
+						}
 					} catch {
-						done(null);
+						done({ text: null, reason: `bad response: ${out.slice(0, 80)}` });
 					}
 				});
 			});
@@ -130,7 +143,7 @@ function translateProse(prose: string): Promise<string | null> {
 					request(opts, candidates.length);
 				} else {
 					clearTimeout(timer);
-					done(null);
+					done({ text: null, reason: "doubao server unreachable (no tunnel socket, TCP 8765 failed)" });
 				}
 			});
 			req.end(body);
@@ -468,7 +481,7 @@ export default function (pi: ExtensionAPI) {
 		if (units.length === 0) return null;
 		const { body, count } = buildRequest(units);
 		if (!body) return null;
-		const reply = await semaphore(() => translateProse(body));
+		const reply = (await semaphore(() => translateProse(body))).text;
 		if (!reply) return null;
 		let translated: string[];
 		if (count === 1) {
@@ -530,7 +543,7 @@ export default function (pi: ExtensionAPI) {
 		const filled = new Map<number, string | null>();
 		await Promise.all(
 			missing.map(async (m, i) => {
-				const t = await semaphore(() => translateProse(m.text.trim()));
+				const t = (await semaphore(() => translateProse(m.text.trim()))).text;
 				filled.set(i, t);
 			}),
 		);
@@ -632,11 +645,13 @@ export default function (pi: ExtensionAPI) {
 				if (notifyDone) ctx.ui.notify("Translation updated", "info");
 			} else {
 				lastFailedKey = key;
-				showStatus("✗ 翻译不可用");
-				setTimeout(clearStatus, STATUS_LINGER_MS);
+				const reason = lastFailReason ?? "unknown";
+				const hhmmss = new Date().toTimeString().slice(0, 8);
+				showStatus(`✗ ${hhmmss} 翻译不可用：${reason}`); // no timer — stays until overwritten
 				refresh(ctx);
-				// Inline notice (transformer) is the single failure signal — no
-				// toast here. A failed health-poll retry (fromRetry) must not
+				if (notifyDone) ctx.ui.notify(`翻译失败：${reason}`, "error");
+				// Auto path (notifyDone=false) keeps the inline transformer notice as
+				// its only signal. A failed health-poll retry (fromRetry) must not
 				// re-arm polling, or it would retry forever.
 				if (!fromRetry) startHealthPoll(ctx);
 			}
@@ -733,7 +748,6 @@ export default function (pi: ExtensionAPI) {
 				saveShowZh(true);
 			}
 			forceTranslate(latest, ctx);
-			ctx.ui.notify("Translating latest reply…", "info");
 			refresh(ctx);
 		},
 	});
