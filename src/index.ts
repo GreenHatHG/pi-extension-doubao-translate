@@ -46,8 +46,7 @@ const RETRY_GIVEUP_MS = 60 * 60_000;
 // per extension so other setStatus callers don't collide.
 const STATUS_KEY = "doubao-zh";
 const STATUS_LINGER_MS = 3_000; // how long ✓/· statuses stay in the footer before clearing
-// Failure status has NO timer: it stays until the next status overwrites it
-// (success clears it, a new failure replaces it).
+const FAIL_STATUS_LINGER_MS = 10_000; // failure hint auto-clears; the inline notice carries the detail
 
 function loadShowZh(): boolean {
 	try {
@@ -552,7 +551,12 @@ export default function (pi: ExtensionAPI) {
 
 	// Only the newest failed reply shows the inline notice; older failures
 	// keep plain original text. Cleared when that text translates.
+	// lastFailNotice carries the timestamp + reason for that failure; success
+	// clears both. notify(error) is never used for failures: its chat line is
+	// permanent, so an old error would outlive the success that fixed it.
 	let lastFailedKey: string | null = null;
+	let lastFailNotice: string | null = null;
+	let failStatusTimer: ReturnType<typeof setTimeout> | null = null;
 	let polling = false;
 
 	// After a failed translation: poll /health (free, no model call) every 5s
@@ -601,8 +605,9 @@ export default function (pi: ExtensionAPI) {
 		requestTranslate(key, ctx, true, fromRetry, true);
 	}
 
-	// notifyDone: manual triggers report back when the request settles; the
-	// auto path stays silent.
+	// notifyDone: manual triggers report success in chat (a dim, replaceable
+	// status line); the auto path stays silent. Failures are NEVER notified —
+	// notify(error) writes a permanent chat line that no success can remove.
 	function requestTranslate(
 		text: string,
 		ctx: {
@@ -638,7 +643,15 @@ export default function (pi: ExtensionAPI) {
 			pending.delete(key);
 			if (t) {
 				translations.set(key, t);
-				if (lastFailedKey === key) lastFailedKey = null; // notice goes away
+				if (lastFailedKey === key) {
+					lastFailedKey = null;
+					lastFailNotice = null; // inline notice goes away too
+				}
+				// Success kills the pending failure-hint clear so ✓ lingers its own 3s.
+				if (failStatusTimer) {
+					clearTimeout(failStatusTimer);
+					failStatusTimer = null;
+				}
 				showStatus("✓ 已翻译");
 				setTimeout(clearStatus, STATUS_LINGER_MS);
 				refresh(ctx);
@@ -647,9 +660,17 @@ export default function (pi: ExtensionAPI) {
 				lastFailedKey = key;
 				const reason = lastFailReason ?? "unknown";
 				const hhmmss = new Date().toTimeString().slice(0, 8);
-				showStatus(`✗ ${hhmmss} 翻译不可用：${reason}`); // no timer — stays until overwritten
+				lastFailNotice = `${hhmmss} 翻译不可用：${reason}`;
+				// Footer: brief failure hint, auto-clears. The inline notice below
+				// the message carries the time + reason until a success clears it.
+				showStatus(`✗ ${lastFailNotice}`);
+				if (failStatusTimer) clearTimeout(failStatusTimer);
+				failStatusTimer = setTimeout(() => {
+					failStatusTimer = null;
+					// Don't wipe a status another request just wrote.
+					if (!pending.size) clearStatus();
+				}, FAIL_STATUS_LINGER_MS);
 				refresh(ctx);
-				if (notifyDone) ctx.ui.notify(`翻译失败：${reason}`, "error");
 				// Auto path (notifyDone=false) keeps the inline transformer notice as
 				// its only signal. A failed health-poll retry (fromRetry) must not
 				// re-arm polling, or it would retry forever.
@@ -814,9 +835,10 @@ export default function (pi: ExtensionAPI) {
 		// t already carries » prefixes (applied per paragraph in reassemble);
 		// prefixing again HERE would put the icons on the original instead.
 		if (t) return `${markdown.trimEnd()}\n\n${SEP}\n\n${t}`;
-		// Latest failure only: one notice on screen at a time.
-		if (lastFailedKey === key) {
-			return `${markdown.trimEnd()}\n\n---\n\n*(翻译不可用，doubao 未响应)*`;
+		// Latest failure only: one notice on screen at a time, with the time
+		// and the real reason; success clears it.
+		if (lastFailedKey === key && lastFailNotice) {
+			return `${markdown.trimEnd()}\n\n---\n\n*(${lastFailNotice})*`;
 		}
 		return markdown;
 	});
