@@ -453,7 +453,60 @@ export default function (pi: ExtensionAPI) {
 		return out;
 	}
 
-	// One request for the whole reply: numbered prose chunks in, split back out.
+	// Doubao summarizes (instead of translating) past ~10k chars per request,
+	// so units are packed into batches under this budget. Marker + separator
+	// overhead is folded into the per-unit count (~8 chars) for slack.
+	const BATCH_BUDGET = 8_500;
+
+	// Greedy in-order bin packing: units keep reply order so each batch's
+	// marker numbering follows the text flow. A single unit over budget (one
+	// huge paragraph or table cell) ships alone — never split mid-sentence,
+	// a cut sentence translates badly and breaks markdown structure.
+	function packUnits(units: Unit[]): Unit[][] {
+		const batches: Unit[][] = [];
+		let cur: Unit[] = [];
+		let curLen = 0;
+		for (const u of units) {
+			if (cur.length > 0 && curLen + u.text.length + 8 > BATCH_BUDGET) {
+				batches.push(cur);
+				cur = [];
+				curLen = 0;
+			}
+			cur.push(u);
+			curLen += u.text.length + 8;
+		}
+		if (cur.length > 0) batches.push(cur);
+		return batches;
+	}
+
+	// One request per batch, batches serial: any failure aborts the rest (the
+	// health-poll retry path handles recovery; don't burn quota on lost cause).
+	// Returns one slot per unit — notice string for dropped markers, undefined
+	// for a skipped slot — or null on failure.
+	async function translateBatches(units: Unit[]): Promise<Array<string | undefined> | null> {
+		const out: Array<string | undefined> = new Array(units.length);
+		let offset = 0;
+		for (const batch of packUnits(units)) {
+			const { body, count } = buildRequest(batch);
+			if (!body) {
+				offset += batch.length;
+				continue;
+			}
+			const reply = (await semaphore(() => translateProse(body))).text;
+			if (!reply) return null;
+			if (count === 1) {
+				out[offset] = reply;
+			} else {
+				const segs = splitTranslation(reply, count);
+				if (!segs) return null; // markers lost entirely: show original, no retry
+				segs.forEach((s, i) => (out[offset + i] = s));
+			}
+			offset += batch.length;
+		}
+		return out;
+	}
+
+	// Pack units under the doubao length limit, one request per batch.
 	// force (manual /translate): send every non-empty part — no length/CJK
 	// gate, and an identical-output result is still shown, not dropped.
 	async function translateText(text: string, force = false): Promise<string | null> {
@@ -478,18 +531,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		});
 		if (units.length === 0) return null;
-		const { body, count } = buildRequest(units);
-		if (!body) return null;
-		const reply = (await semaphore(() => translateProse(body))).text;
-		if (!reply) return null;
-		let translated: string[];
-		if (count === 1) {
-			translated = [reply];
-		} else {
-			const segs = splitTranslation(reply, count);
-			if (!segs) return null; // markers lost entirely: show original, no retry
-			translated = segs;
-		}
+		const translated = await translateBatches(units);
+		if (!translated) return null;
 		// Map marker slots back onto parts; table cells land in their own map
 		// so the table can be rebuilt with the original shape. Dropped
 		// segments get retried.
